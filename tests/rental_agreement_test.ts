@@ -33,13 +33,13 @@ Clarinet.test({
 });
 
 Clarinet.test({
-    name: "Can pay rent",
+    name: "Can pay rent and confirm payment",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
         const tenant = accounts.get('wallet_1')!;
         const monthlyRent = 1000;
 
-        // First create an agreement
+        // Create agreement
         let block = chain.mineBlock([
             Tx.contractCall('rental_agreement', 'create-agreement', [
                 types.principal(tenant.address),
@@ -50,7 +50,7 @@ Clarinet.test({
             ], deployer.address)
         ]);
 
-        // Then pay rent
+        // Pay rent
         let paymentBlock = chain.mineBlock([
             Tx.contractCall('rental_agreement', 'pay-rent', [
                 types.uint(0),
@@ -59,6 +59,26 @@ Clarinet.test({
         ]);
 
         paymentBlock.receipts[0].result.expectOk();
+
+        // Confirm payment
+        let confirmBlock = chain.mineBlock([
+            Tx.contractCall('rental_agreement', 'confirm-payment', [
+                types.uint(0),
+                types.uint(0)
+            ], deployer.address)
+        ]);
+
+        confirmBlock.receipts[0].result.expectOk();
+
+        // Get agreement details to verify payment recorded
+        let detailsBlock = chain.mineBlock([
+            Tx.contractCall('rental_agreement', 'get-agreement-details', [
+                types.uint(0)
+            ], deployer.address)
+        ]);
+
+        const agreement = detailsBlock.receipts[0].result.expectOk().expectTuple();
+        assertEquals(agreement['total-paid'], types.uint(1000));
     }
 });
 
