@@ -7,14 +7,17 @@
 (define-constant ERR-CONTRACT-PAUSED (err u105))
 (define-constant ERR-INVALID-DATE (err u106))
 (define-constant ERR-SECURITY-DEPOSIT-NOT-PAID (err u107))
+(define-constant ERR-PAYMENT-TOO-SMALL (err u108))
+(define-constant ERR-GRACE-PERIOD-EXPIRED (err u109))
 
 ;; Define data vars
 (define-data-var next-agreement-id uint u0)
 (define-data-var next-payment-id uint u0)
 (define-data-var contract-paused bool false)
 (define-data-var contract-owner principal tx-sender)
+(define-data-var grace-period-days uint u5)
 
-;; Define data maps
+;; Enhanced agreements map
 (define-map agreements
     { agreement-id: uint }
     {
@@ -28,10 +31,12 @@
         active: bool,
         total-paid: uint,
         last-payment-date: uint,
-        next-payment-due: uint
+        next-payment-due: uint,
+        grace-period-end: uint
     }
 )
 
+;; Enhanced payments map
 (define-map payments
     { agreement-id: uint, payment-id: uint }
     {
@@ -40,11 +45,12 @@
         confirmed: bool,
         payer: principal,
         payment-type: (string-utf8 20),
-        is-late: bool
+        is-late: bool,
+        remaining-balance: uint
     }
 )
 
-;; Events
+;; Enhanced events
 (define-data-var last-event-id uint u0)
 
 (define-map events
@@ -52,37 +58,37 @@
     {
         event-type: (string-utf8 20),
         agreement-id: uint,
-        data: (optional (string-utf8 100))
+        data: (optional (string-utf8 100)),
+        timestamp: uint
     }
 )
 
-;; Contract pause/unpause functions
-(define-public (pause-contract)
-    (begin
-        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-        (var-set contract-paused true)
-        (ok true)
+;; Helper function for payment validation
+(define-private (is-valid-payment (agreement-id uint) (amount uint))
+    (let
+        ((agreement (unwrap! (map-get? agreements { agreement-id: agreement-id }) false)))
+        (and
+            (>= amount u0)
+            (<= amount (get monthly-rent agreement))
+            (get active agreement)
+        )
     )
 )
 
-(define-public (unpause-contract)
-    (begin
-        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-        (var-set contract-paused false)
-        (ok true)
-    )
-)
-
-;; Helper function to record events
+;; Enhanced record-event function
 (define-private (record-event (event-type (string-utf8 20)) (agreement-id uint) (data (optional (string-utf8 100))))
     (let
-        ((event-id (var-get last-event-id)))
+        (
+            (event-id (var-get last-event-id))
+            (current-time (unwrap! (get-block-info? time u0) u0))
+        )
         (map-set events
             { event-id: event-id }
             {
                 event-type: event-type,
                 agreement-id: agreement-id,
-                data: data
+                data: data,
+                timestamp: current-time
             }
         )
         (var-set last-event-id (+ event-id u1))
@@ -90,52 +96,7 @@
     )
 )
 
-;; Create new rental agreement
-(define-public (create-agreement (tenant principal) (monthly-rent uint) (security-deposit uint) (start-date uint) (end-date uint))
-    (let
-        ((agreement-id (var-get next-agreement-id)))
-        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
-        (asserts! (> end-date start-date) ERR-INVALID-DATE)
-        (map-set agreements
-            { agreement-id: agreement-id }
-            {
-                landlord: tx-sender,
-                tenant: tenant,
-                monthly-rent: monthly-rent,
-                security-deposit: security-deposit,
-                security-deposit-paid: false,
-                start-date: start-date,
-                end-date: end-date,
-                active: true,
-                total-paid: u0,
-                last-payment-date: u0,
-                next-payment-due: start-date
-            }
-        )
-        (var-set next-agreement-id (+ agreement-id u1))
-        (record-event "agreement-created" agreement-id none)
-        (ok agreement-id)
-    )
-)
-
-;; Pay security deposit
-(define-public (pay-security-deposit (agreement-id uint))
-    (let
-        ((agreement (unwrap! (map-get? agreements { agreement-id: agreement-id }) ERR-AGREEMENT-NOT-FOUND)))
-        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
-        (asserts! (is-eq tx-sender (get tenant agreement)) ERR-NOT-AUTHORIZED)
-        (asserts! (not (get security-deposit-paid agreement)) ERR-PAYMENT-ALREADY-CONFIRMED)
-        
-        (map-set agreements
-            { agreement-id: agreement-id }
-            (merge agreement { security-deposit-paid: true })
-        )
-        (record-event "security-deposit-paid" agreement-id none)
-        (ok true)
-    )
-)
-
-;; Pay rent with payment tracking and late payment detection
+;; Enhanced pay-rent function with validation
 (define-public (pay-rent (agreement-id uint) (amount uint))
     (let
         (
@@ -143,10 +104,13 @@
             (payment-id (var-get next-payment-id))
             (current-time (unwrap! (get-block-info? time u0) ERR-INVALID-DATE))
             (is-late (> current-time (get next-payment-due agreement)))
+            (grace-period-end (get grace-period-end agreement))
         )
         (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
         (asserts! (is-eq tx-sender (get tenant agreement)) ERR-NOT-AUTHORIZED)
         (asserts! (get security-deposit-paid agreement) ERR-SECURITY-DEPOSIT-NOT-PAID)
+        (asserts! (is-valid-payment agreement-id amount) ERR-INVALID-AMOUNT)
+        (asserts! (or (not is-late) (<= current-time grace-period-end)) ERR-GRACE-PERIOD-EXPIRED)
         
         (map-set payments
             { agreement-id: agreement-id, payment-id: payment-id }
@@ -156,14 +120,18 @@
                 confirmed: false,
                 payer: tx-sender,
                 payment-type: "rent",
-                is-late: is-late
+                is-late: is-late,
+                remaining-balance: (- (get monthly-rent agreement) amount)
             }
         )
         
         (var-set next-payment-id (+ payment-id u1))
-        (record-event "rent-payment-made" agreement-id none)
+        (record-event "rent-payment-made" 
+                    agreement-id 
+                    (some (concat (concat "Amount: " (to-string amount)) 
+                                (concat " Late: " (to-string is-late)))))
         (ok payment-id)
     )
 )
 
-[... remaining functions remain unchanged ...]
+[... remaining functions unchanged ...]
